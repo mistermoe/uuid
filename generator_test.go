@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -709,7 +710,35 @@ func testNewV7(t *testing.T) {
 	t.Run("ShortRandomReadWithOptions", makeTestNewV7ShortRandomReadWithOptions())
 	t.Run("KSortable", makeTestNewV7KSortable())
 	t.Run("ClockSequence", makeTestNewV7ClockSequence())
+	t.Run("CounterRollover", makeTestNewV7CounterRollover())
+	t.Run("BorrowIsBounded", makeTestNewV7BorrowIsBounded())
+	t.Run("CounterReseedsOnNewTick", makeTestNewV7CounterReseedsOnNewTick())
+	t.Run("MixedWithV1", makeTestNewV7MixedWithV1())
+	t.Run("BackwardsClock", makeTestNewV7BackwardsClock())
+	t.Run("AtTimeHistorical", makeTestNewV7AtTimeHistorical())
+	t.Run("AtTimeUnrepresentable", makeTestNewV7AtTimeUnrepresentable())
+	t.Run("Concurrent", makeTestNewV7Concurrent())
+	t.Run("FaultyRandOnReseed", makeTestNewV7FaultyRandOnReseed())
+	t.Run("FaultyRandOnRollover", makeTestNewV7FaultyRandOnRollover())
 	t.Run("AtSpecificTime", makeTestNewV7AtTime())
+}
+
+// v7Counter returns the 12 bits of rand_a that hold the monotonic counter.
+func v7Counter(u UUID) uint16 {
+	return binary.BigEndian.Uint16(u[6:8]) & maxV7Counter
+}
+
+// assertV7Increasing fails on the first UUID that does not sort above its
+// predecessor. A single generator should never produce one.
+func assertV7Increasing(t *testing.T, uuids []UUID) {
+	t.Helper()
+
+	for i := 1; i < len(uuids); i++ {
+		p, n := uuids[i-1], uuids[i]
+		if p.String() >= n.String() {
+			t.Fatalf("uuids[%d] (%s) not less than uuids[%d] (%s)", i-1, p, i, n)
+		}
+	}
 }
 
 func makeTestNewV7Basic() func(t *testing.T) {
@@ -731,7 +760,7 @@ func makeTestNewV7Basic() func(t *testing.T) {
 func makeTestNewV7TestVector() func(t *testing.T) {
 	return func(t *testing.T) {
 		pRand := make([]byte, 10)
-		//first 2 bytes will be read by clockSeq. First 4 bits will be overridden by Version. The next bits should be 0xCC3(3267)
+		//first 2 bytes will be read to seed the counter. First 4 bits will be overridden by Version. The next bits should be 0xCC3(3267)
 		binary.LittleEndian.PutUint16(pRand[:2], uint16(0xCC3))
 		//8bytes will be read for rand_b. First 2 bits will be overridden by Variant
 		binary.LittleEndian.PutUint64(pRand[2:], uint64(0x18C4DC0C0C07398F))
@@ -939,20 +968,430 @@ func makeTestNewV7ClockSequence() func(t *testing.T) {
 		g.epochFunc = func() time.Time {
 			return time.UnixMilli(1645557742000)
 		}
-		//by being KSortable with the same timestamp, it means the sequence is Not empty, and it is monotonic
-		uuids := make([]UUID, 10)
+		//by being KSortable with the same timestamp, it means the sequence is Not empty, and it is monotonic.
+		//The count is well past the 4096 values the 12 bit counter can hold, so a rollover has to be
+		//handled without breaking the ordering.
+		uuids := make([]UUID, 5000)
 		for i := range uuids {
 			u, err := g.NewV7()
 			testErrCheck(t, "NewV7()", "", err)
 			uuids[i] = u
 		}
 
-		for i := 1; i < len(uuids); i++ {
-			p, n := uuids[i-1], uuids[i]
-			isLess := p.String() < n.String()
-			if !isLess {
-				t.Errorf("uuids[%d] (%s) not less than uuids[%d] (%s)", i-1, p, i, n)
+		assertV7Increasing(t, uuids)
+	}
+}
+
+// makeTestNewV7CounterRollover generates far more UUIDs within a single
+// millisecond than the 12 bit counter can hold, which is where the counter used
+// to wrap from 0xfff back to 0x000 and reorder UUIDs against their predecessor.
+func makeTestNewV7CounterRollover() func(t *testing.T) {
+	return func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("skipping test in short mode.")
+		}
+
+		g := NewGenWithOptions(WithEpochFunc(func() time.Time {
+			return time.UnixMilli(1645557742000)
+		}))
+
+		uuids := make([]UUID, 50000)
+		for i := range uuids {
+			u, err := g.NewV7()
+			testErrCheck(t, "NewV7()", "", err)
+			uuids[i] = u
+		}
+
+		assertV7Increasing(t, uuids)
+	}
+}
+
+// makeTestNewV7BorrowIsBounded checks the cost of the rollover handling: the
+// embedded timestamp runs ahead of the real one, but only by as many
+// milliseconds as there were counter rollovers.
+func makeTestNewV7BorrowIsBounded() func(t *testing.T) {
+	return func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("skipping test in short mode.")
+		}
+
+		const (
+			count  = 50000
+			atMs   = 1645557742000
+			usable = maxV7Counter - v7CounterSeedMask // increments guaranteed within a tick
+		)
+
+		g := NewGenWithOptions(WithEpochFunc(func() time.Time {
+			return time.UnixMilli(atMs)
+		}))
+
+		var last UUID
+		for range count {
+			u, err := g.NewV7()
+			testErrCheck(t, "NewV7()", "", err)
+			last = u
+		}
+
+		ts, err := TimestampFromV7(last)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := ts.Time()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ahead := got.UnixMilli() - atMs
+		if ahead < 0 {
+			t.Fatalf("timestamp went backwards by %dms", -ahead)
+		}
+		if want := int64(count/usable + 1); ahead > want {
+			t.Errorf("timestamp ran %dms ahead of the clock, want at most %dms", ahead, want)
+		}
+	}
+}
+
+// makeTestNewV7CounterReseedsOnNewTick pins the random reader so the counter is
+// predictable, then checks that a new millisecond reseeds it from that reader
+// rather than continuing to climb, and that all 12 bits survive SetVersion.
+func makeTestNewV7CounterReseedsOnNewTick() func(t *testing.T) {
+	return func(t *testing.T) {
+		// Two counter seeds, each followed by the 8 bytes read for rand_b.
+		seeds := []uint16{0xabcd, 0x1234}
+		buf := make([]byte, 0, 2*(2+8))
+		for _, seed := range seeds {
+			buf = binary.BigEndian.AppendUint16(buf, seed)
+			buf = append(buf, make([]byte, 8)...)
+		}
+
+		ms := int64(1645557742000)
+		g := NewGenWithOptions(
+			WithRandomReader(bytes.NewReader(buf)),
+			WithEpochFunc(func() time.Time { return time.UnixMilli(ms) }),
+		)
+
+		first, err := g.NewV7()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ms++
+		second, err := g.NewV7()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for i, u := range []UUID{first, second} {
+			// The guard bit keeps the counter in the lower half of its range,
+			// leaving room to increment within the tick.
+			want := seeds[i] & v7CounterSeedMask
+			if got := v7Counter(u); got != want {
+				t.Errorf("uuid %d: got counter %#03x, want %#03x", i, got, want)
 			}
+		}
+		if first.String() >= second.String() {
+			t.Errorf("%v is not less than %v", first, second)
+		}
+	}
+}
+
+// makeTestNewV7MixedWithV1 guards against V7 sharing counter and timestamp state
+// with V1. V1 counts its epoch in 100 nanosecond intervals since 1582, which
+// dwarfs any millisecond value V7 compares against, and its clock sequence is 14
+// bits wide rather than 12. The timestamp is pinned so that every UUID lands in
+// the same tick, leaving the counter as the only thing keeping them in order.
+func makeTestNewV7MixedWithV1() func(t *testing.T) {
+	return func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("skipping test in short mode.")
+		}
+
+		const atMs = 1645557742000
+
+		g := NewGenWithOptions(WithEpochFunc(func() time.Time {
+			return time.UnixMilli(atMs)
+		}))
+
+		uuids := make([]UUID, 5000)
+		for i := range uuids {
+			if _, err := g.NewV1(); err != nil {
+				t.Fatal(err)
+			}
+			u, err := g.NewV7()
+			if err != nil {
+				t.Fatal(err)
+			}
+			uuids[i] = u
+		}
+
+		assertV7Increasing(t, uuids)
+
+		// The V1 epoch must not have been mistaken for a millisecond count and
+		// left in the V7 timestamp field.
+		ts, err := TimestampFromV7(uuids[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := ts.Time()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.UnixMilli() != atMs {
+			t.Errorf("first UUID encodes %v (%dms), want the provided %dms", got.UTC(), got.UnixMilli(), atMs)
+		}
+	}
+}
+
+// makeTestNewV7BackwardsClock checks that a clock correction cannot reorder
+// UUIDs, per the monotonic error checking guidance in RFC 9562 section 6.2.
+func makeTestNewV7BackwardsClock() func(t *testing.T) {
+	return func(t *testing.T) {
+		ms := int64(1645557742000)
+		g := NewGenWithOptions(WithEpochFunc(func() time.Time {
+			return time.UnixMilli(ms)
+		}))
+
+		uuids := make([]UUID, 0, 30)
+		for _, step := range []int64{1, 1, -5000, 1, -1, 2} {
+			for range 5 {
+				u, err := g.NewV7()
+				if err != nil {
+					t.Fatal(err)
+				}
+				uuids = append(uuids, u)
+			}
+			ms += step
+		}
+
+		assertV7Increasing(t, uuids)
+	}
+}
+
+// makeTestNewV7AtTimeHistorical checks that the protection against a backwards
+// clock does not leak into the explicit timestamp API: a caller asking for an
+// older timestamp gets that timestamp, and a batch at that timestamp stays
+// ordered.
+func makeTestNewV7AtTimeHistorical() func(t *testing.T) {
+	return func(t *testing.T) {
+		g := NewGen()
+
+		if _, err := g.NewV7(); err != nil {
+			t.Fatal(err)
+		}
+
+		atTime := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+		uuids := make([]UUID, 10)
+		for i := range uuids {
+			u, err := g.NewV7AtTime(atTime)
+			if err != nil {
+				t.Fatal(err)
+			}
+			uuids[i] = u
+		}
+
+		assertV7Increasing(t, uuids)
+
+		for i, u := range uuids {
+			ts, err := TimestampFromV7(u)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := ts.Time()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !got.Equal(atTime) {
+				t.Fatalf("uuids[%d] encodes %v, want the provided %v", i, got.UTC(), atTime)
+			}
+		}
+	}
+}
+
+// makeTestNewV7AtTimeUnrepresentable covers times the 48-bit millisecond field
+// cannot hold, such as the zero time. They are pinned to the nearest end of the
+// range, and must not drag the generator along with them: without that, the
+// negative millisecond count of a zero time would read as a timestamp far in the
+// future and hold every later UUID there.
+func makeTestNewV7AtTimeUnrepresentable() func(t *testing.T) {
+	return func(t *testing.T) {
+		for _, tt := range []struct {
+			name   string
+			atTime time.Time
+			want   int64
+		}{
+			{name: "ZeroTime", atTime: time.Time{}, want: 0},
+			{name: "BeforeUnixEpoch", atTime: time.Date(1969, 7, 20, 20, 17, 0, 0, time.UTC), want: 0},
+			{name: "AfterTimestampRange", atTime: time.Date(20000, 1, 1, 0, 0, 0, 0, time.UTC), want: maxV7Timestamp},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				g := NewGen()
+
+				u, err := g.NewV7AtTime(tt.atTime)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ts, err := TimestampFromV7(u)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := ts.Time()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got.UnixMilli() != tt.want {
+					t.Errorf("%v encodes %dms, want %dms", u, got.UnixMilli(), tt.want)
+				}
+
+				next, err := g.NewV7()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if u.String() >= next.String() {
+					t.Errorf("%v is not less than %v", u, next)
+				}
+
+				if tt.want > 0 {
+					// A timestamp ahead of the clock holds the generator there,
+					// so there is nothing more to check.
+					return
+				}
+
+				// A timestamp below the clock leaves the generator tracking it.
+				ts, err = TimestampFromV7(next)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err = ts.Time()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if drift := time.Since(got); drift < 0 || drift > time.Minute {
+					t.Errorf("%v is %v away from now", next, drift)
+				}
+			})
+		}
+	}
+}
+
+// makeTestNewV7Concurrent checks that no two UUIDs from one generator share a
+// timestamp and counter, which is the pair the ordering guarantee rests on.
+func makeTestNewV7Concurrent() func(t *testing.T) {
+	return func(t *testing.T) {
+		const (
+			goroutines = 8
+			perRoutine = 2000
+		)
+
+		g := NewGen()
+
+		var wg sync.WaitGroup
+		results := make([][]UUID, goroutines)
+		for i := range results {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+
+				uuids := make([]UUID, perRoutine)
+				for j := range uuids {
+					u, err := g.NewV7()
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					uuids[j] = u
+				}
+				results[i] = uuids
+			}(i)
+		}
+		wg.Wait()
+
+		if t.Failed() {
+			return
+		}
+
+		type sequence struct {
+			ms      uint64
+			counter uint16
+		}
+		seen := make(map[sequence]UUID, goroutines*perRoutine)
+		for _, uuids := range results {
+			for _, u := range uuids {
+				ts, err := TimestampFromV7(u)
+				if err != nil {
+					t.Fatal(err)
+				}
+				key := sequence{ms: uint64(ts), counter: v7Counter(u)}
+				if prev, ok := seen[key]; ok {
+					t.Fatalf("%v and %v share a timestamp and counter", prev, u)
+				}
+				seen[key] = u
+			}
+		}
+	}
+}
+
+// makeTestNewV7FaultyRandOnReseed fails the read that seeds the counter for a
+// new millisecond.
+func makeTestNewV7FaultyRandOnReseed() func(t *testing.T) {
+	return func(t *testing.T) {
+		ms := int64(1645557742000)
+		g := NewGenWithOptions(
+			WithRandomReader(&seedFailReader{failOn: 2}),
+			WithEpochFunc(func() time.Time { return time.UnixMilli(ms) }),
+		)
+
+		if _, err := g.NewV7(); err != nil {
+			t.Fatal(err)
+		}
+
+		ms++
+		u, err := g.NewV7()
+		if err == nil {
+			t.Errorf("got %v, nil error for the counter reseed", u)
+		}
+		if u != Nil {
+			t.Errorf("got %v on error, want Nil", u)
+		}
+	}
+}
+
+// makeTestNewV7FaultyRandOnRollover fails the read that reseeds the counter
+// after it is exhausted within a millisecond. Seeding the counter as high as the
+// guard bit allows also pins down the guaranteed headroom within a tick.
+func makeTestNewV7FaultyRandOnRollover() func(t *testing.T) {
+	return func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("skipping test in short mode.")
+		}
+
+		g := NewGenWithOptions(
+			WithRandomReader(&seedFailReader{failOn: 2}),
+			WithEpochFunc(func() time.Time { return time.UnixMilli(1645557742000) }),
+		)
+
+		first, err := g.NewV7()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := v7Counter(first), uint16(v7CounterSeedMask); got != want {
+			t.Fatalf("got counter %#03x, want %#03x", got, want)
+		}
+
+		for i := range maxV7Counter - v7CounterSeedMask {
+			u, err := g.NewV7()
+			if err != nil {
+				t.Fatalf("uuid %d: unexpected error: %v", i, err)
+			}
+			if got, want := v7Counter(u), uint16(v7CounterSeedMask+1+i); got != want {
+				t.Fatalf("uuid %d: got counter %#03x, want %#03x", i, got, want)
+			}
+		}
+
+		u, err := g.NewV7()
+		if err == nil {
+			t.Errorf("got %v, nil error for the counter rollover", u)
+		}
+		if u != Nil {
+			t.Errorf("got %v on error, want Nil", u)
 		}
 	}
 }
@@ -971,12 +1410,16 @@ func makeTestNewV7AtTime() func(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Even with the same timestamp, there is still a random portion,
-		// so they should not be 100% identical. Bytes 0-6 are the timestamp so they should be identical.
-		u1Bytes := u1.Bytes()[:7]
-		u2Bytes := u2.Bytes()[:7]
+		// Bytes 0-5 hold the 48 bit timestamp, so they should be identical. The
+		// remaining bytes carry the monotonic counter and the random portion,
+		// which must differ so that the second UUID sorts above the first.
+		u1Bytes := u1.Bytes()[:6]
+		u2Bytes := u2.Bytes()[:6]
 		if !bytes.Equal(u1Bytes, u2Bytes) {
 			t.Errorf("generated different UUIDs across calls with same timestamp: %v / %v", u1, u2)
+		}
+		if u1.String() >= u2.String() {
+			t.Errorf("%v is not less than %v", u1, u2)
 		}
 
 		ts1, err := TimestampFromV7(u1)
@@ -1145,6 +1588,31 @@ func (r *faultyReader) Read(dest []byte) (int, error) {
 		return 0, fmt.Errorf("io: reader is faulty")
 	}
 	return rand.Read(dest)
+}
+
+// seedFailReader fails a chosen V7 counter seed and serves every other seed as
+// 0xffff, which the guard bit trims to the highest value a seed can take. V7
+// reads exactly two bytes for the counter seed and eight for rand_b, so the
+// length of the read identifies which is being served.
+type seedFailReader struct {
+	seeds  int
+	failOn int // seed number to fail, counting from one
+}
+
+func (r *seedFailReader) Read(dest []byte) (int, error) {
+	if len(dest) != 2 {
+		return rand.Read(dest)
+	}
+
+	r.seeds++
+	if r.seeds == r.failOn {
+		return 0, fmt.Errorf("io: reader is faulty")
+	}
+	for i := range dest {
+		dest[i] = 0xff
+	}
+
+	return len(dest), nil
 }
 
 // testErrCheck looks to see if errContains is a substring of err.Error(). If
