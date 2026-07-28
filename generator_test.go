@@ -760,9 +760,10 @@ func makeTestNewV7Basic() func(t *testing.T) {
 func makeTestNewV7TestVector() func(t *testing.T) {
 	return func(t *testing.T) {
 		pRand := make([]byte, 10)
-		//first 2 bytes will be read to seed the counter. First 4 bits will be overridden by Version. The next bits should be 0xCC3(3267)
+		// First 2 bytes will be read to seed the counter (11 bits are used; the top bit is cleared as a guard).
+		// The first 4 bits of u[6] will be overridden by the Version field.
 		binary.LittleEndian.PutUint16(pRand[:2], uint16(0xCC3))
-		//8bytes will be read for rand_b. First 2 bits will be overridden by Variant
+		// 8bytes will be read for rand_b. First 2 bits will be overridden by Variant
 		binary.LittleEndian.PutUint64(pRand[2:], uint64(0x18C4DC0C0C07398F))
 
 		g := &Gen{
