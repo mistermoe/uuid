@@ -121,10 +121,10 @@ func NewV7() (UUID, error) {
 // 12-bit monotonic counter in rand_a, as described by RFC 9562 section 6.2,
 // Method 1.
 //
-// The provided timestamp is encoded as given, so unlike NewV7 the ordering
-// guarantee only holds for timestamps that do not move backwards. Timestamps
-// that repeat or advance behave as they do for NewV7, including the timestamp
-// being incremented ahead of the provided one once the counter is exhausted.
+// The provided timestamp is used as the starting point for generation, so unlike
+// NewV7 the ordering guarantee only holds for timestamps that do not move
+// backwards. Timestamps that repeat or advance behave as they do for NewV7,
+// including the embedded timestamp being incremented once the counter is exhausted.
 // Providing a timestamp ahead of the clock therefore holds later NewV7 UUIDs at
 // that timestamp, since going back below it would break their ordering. Times
 // outside the range the 48-bit millisecond field can represent are pinned to the
