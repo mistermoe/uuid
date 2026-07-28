@@ -711,6 +711,7 @@ func testNewV7(t *testing.T) {
 	t.Run("KSortable", makeTestNewV7KSortable())
 	t.Run("ClockSequence", makeTestNewV7ClockSequence())
 	t.Run("CounterRollover", makeTestNewV7CounterRollover())
+	t.Run("Sequential1000000", makeTestNewV7Sequential1000000())
 	t.Run("BorrowIsBounded", makeTestNewV7BorrowIsBounded())
 	t.Run("CounterReseedsOnNewTick", makeTestNewV7CounterReseedsOnNewTick())
 	t.Run("MixedWithV1", makeTestNewV7MixedWithV1())
@@ -1004,6 +1005,34 @@ func makeTestNewV7CounterRollover() func(t *testing.T) {
 		}
 
 		assertV7Increasing(t, uuids)
+	}
+}
+
+// makeTestNewV7Sequential1000000 is the ordering check at load, against the real
+// clock so that counter rollovers, the reseeding that follows them and the clock
+// advancing on its own all interleave. Sorting strictly above the previous UUID
+// also means differing from it, so this covers uniqueness across the run. UUIDs
+// are compared as they are generated rather than collected first, to keep the
+// count free to grow.
+func makeTestNewV7Sequential1000000() func(t *testing.T) {
+	return func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("skipping test in short mode.")
+		}
+
+		g := NewGen()
+
+		var prev string
+		for i := range 1000000 {
+			u, err := g.NewV7()
+			testErrCheck(t, "NewV7()", "", err)
+
+			cur := u.String()
+			if cur <= prev {
+				t.Fatalf("uuids[%d] (%s) not less than uuids[%d] (%s)", i-1, prev, i, cur)
+			}
+			prev = cur
+		}
 	}
 }
 
